@@ -28,36 +28,57 @@ mat get_cost(double* x, double* hazard_list, double hazard_radius);
 mat get_C(double* x, double* hazard_list, double hazard_radius, double delta_t);
 mat get_I(const mat & cost_vector, const mat & lambda_vector, const mat & mu_vector);
 
+// 主要基于al-ilqr这篇文章的思路实现：https://bjack205.github.io/papers/AL_iLQR_Tutorial.pdf
 extern "C" {
     double* get_action(double* init_x, double delta_t, double damping_ratio, double learning_rate, double* R_data, double* Qf_data, 
                         double* Q_data, double* target_x, double* u_list, double* lambda_data, double* mu_data, double* hazard_list, double hazard_radius){
         mat R_mat(R_data, U_DIM, U_DIM);
         mat Q_mat(Q_data, X_DIM, X_DIM);
         mat Qf_mat(Qf_data, X_DIM, X_DIM);
+        // 这里理解成nominal reference。 
         mat target_x_vector(target_x, X_DIM, 1);
+        // 状态量。
         double x_list[X_DIM*(TIME_HORIZON+1)] = {};
+        //更新后的状态量/控制量。
         double new_x_list[X_DIM*(TIME_HORIZON+1)] = {};
         double new_u_list[U_DIM*TIME_HORIZON] = {};
+        // jacob值
         double J_value;
+        
         mat x_vector, u_vector, temp_vector, temp_mat;
+        
         double x[X_DIM], u[U_DIM], next_x[X_DIM];
+        
         mat K_list[TIME_HORIZON], d_list[TIME_HORIZON];
+        // 迭代数？
         int max_cnt = 10; 
         int cnt;
+        
         double pre_J_value;
         mat P_mat;
         mat p_vector;
+        // 状态矩阵
         mat A_mat, B_mat;
+        
+        // ilqr的更新矩阵
         mat Qxx, Quu, Qux, Qxu, Qx, Qu, K_mat, d_vector;
+        
         mat delta_x, delta_u;
+        
         mat cost_vector, C_mat, I_mat;
+        // 拉格朗日乘子
         mat lambda_vector(lambda_data, COST_DIM, 1);
+        // penality 乘子
         mat mu_vector(mu_data, COST_DIM, 1);
+        
         mat lambda_list[TIME_HORIZON + 1];
+        //每次更新的scaling， mu = mu*mu_scaling_factor。
         double mu_scaling_factor = 2.0;
-
+        
+        //初始设置
         J_value = 0;
         append(x_list, 0, init_x, X_DIM);
+        
         for(int t_idx=0; t_idx<TIME_HORIZON; t_idx++){
             get(x_list, t_idx*X_DIM, X_DIM, x);
             get(u_list, t_idx*U_DIM, U_DIM, u);
@@ -66,13 +87,17 @@ extern "C" {
 
             x_vector = mat(x, X_DIM, 1);
             u_vector = mat(u, U_DIM, 1);
+            //delta_x
             temp_vector = x_vector - target_x_vector;
+            // 0.5*delta_x^T Q delta_x？是cost funxtion中的状态cost 一项
             temp_mat = temp_vector.transpose().matmul(Q_mat.matmul(temp_vector))*0.5;
             if(temp_mat.col != 1 || temp_mat.row != 1){
                 std::cerr<<"[error!!] do not match dimension"<<std::endl;
                 throw ERR;
             }
             J_value += temp_mat.data[0];
+            
+            // 0.5*u^T R u
             temp_mat = u_vector.transpose().matmul(R_mat.matmul(u_vector))*0.5;
             if(temp_mat.col != 1 || temp_mat.row != 1){
                 std::cerr<<"[error!!] do not match dimension"<<std::endl;
@@ -90,6 +115,7 @@ extern "C" {
         get(x_list, TIME_HORIZON*X_DIM, X_DIM, x);
         x_vector = mat(x, X_DIM, 1);
         temp_vector = x_vector - target_x_vector;
+        // 0.5*delta_x^T Qf x
         temp_mat = temp_vector.transpose().matmul(Qf_mat.matmul(temp_vector))*0.5;
         if(temp_mat.col != 1 || temp_mat.row != 1){
             std::cerr<<"[error!!] do not match dimension"<<std::endl;
@@ -106,18 +132,24 @@ extern "C" {
             for(int t_idx=0; t_idx<TIME_HORIZON+1; t_idx++){
                 get(x_list, t_idx*X_DIM, X_DIM, x);
                 cost_vector = get_cost(x, hazard_list, hazard_radius);
+                // al-ilqr 公式57
                 lambda_list[t_idx] = (lambda_list[t_idx] + mu_vector*cost_vector).max(0.0).min(10.0);
             }
+            // al-ilqr 公式58
             mu_vector = mu_vector*mu_scaling_factor;
             ////////////////////////////////////
 
             get(x_list, TIME_HORIZON*X_DIM, X_DIM, x);
             cost_vector = get_cost(x, hazard_list, hazard_radius);
+            // 更新拉格朗日乘子中的c(x), I
             C_mat = get_C(x, hazard_list, hazard_radius, delta_t);
             I_mat = get_I(cost_vector, lambda_list[TIME_HORIZON], mu_vector);
+            // P是hessian？公式 39
             P_mat = Qf_mat + C_mat.transpose().matmul(I_mat.matmul(C_mat));
             x_vector = mat(x, X_DIM, 1);
+            // 公式38
             p_vector = Qf_mat.matmul(x_vector - target_x_vector) + C_mat.transpose().matmul(lambda_list[TIME_HORIZON] + I_mat.matmul(cost_vector));
+            // backward 阶段。
             for(int t_idx=TIME_HORIZON-1; t_idx>=0; t_idx--){
                 get(x_list, t_idx*X_DIM, X_DIM, x);
                 get(u_list, t_idx*U_DIM, U_DIM, u);
@@ -125,40 +157,50 @@ extern "C" {
                 u_vector = mat(u, U_DIM, 1);
                 A_mat = get_A(x, u, delta_t);
                 B_mat = get_B(x, u, delta_t);
+                // 注意是在backward 阶段使用到了拉格朗日乘子
                 cost_vector = get_cost(x, hazard_list, hazard_radius);
                 C_mat = get_C(x, hazard_list, hazard_radius, delta_t);
                 I_mat = get_I(cost_vector, lambda_list[t_idx], mu_vector);
+                // AL-ilqr公式41-45.
                 Qxx = Q_mat + A_mat.transpose().matmul(P_mat.matmul(A_mat)) + C_mat.transpose().matmul(I_mat.matmul(C_mat));
                 Quu = R_mat + B_mat.transpose().matmul(P_mat.matmul(B_mat));
                 Qux = B_mat.transpose().matmul(P_mat.matmul(A_mat));
                 Qxu = A_mat.transpose().matmul(P_mat.matmul(B_mat));
                 Qx = Q_mat.matmul(x_vector - target_x_vector) + A_mat.transpose().matmul(p_vector) + C_mat.transpose().matmul(lambda_list[t_idx] + I_mat.matmul(cost_vector));
                 Qu = R_mat.matmul(u_vector) + B_mat.transpose().matmul(p_vector);
-
+                // 公式46的计算
                 temp_mat = (Quu + mat(U_DIM)*damping_ratio).inverse()*(-1.0);
                 K_mat = temp_mat.matmul(Qux);
                 d_vector = temp_mat.matmul(Qu);
-
+                // 公式47，48
                 P_mat = Qxx + K_mat.transpose().matmul(Quu.matmul(K_mat) + Qux) + Qxu.matmul(K_mat);
                 p_vector = Qx + K_mat.transpose().matmul(Quu.matmul(d_vector) + Qu) + Qxu.matmul(d_vector);
+                // 
                 K_list[t_idx] = K_mat;
                 d_list[t_idx] = d_vector;
             }
-
+            // forward 阶段
+            // 初始化
             append(new_x_list, 0, init_x, X_DIM);
             J_value = 0.0;
             for(int t_idx=0; t_idx<TIME_HORIZON; t_idx++){
+                // 上一轮状态？
                 get(x_list, t_idx*X_DIM, X_DIM, x);
                 x_vector = mat(x, X_DIM, 1);
+                // 当前轮状态？
                 get(new_x_list, t_idx*X_DIM, X_DIM, x);
                 temp_vector = mat(x, X_DIM, 1);
+            
+                // 公式50
                 delta_x = temp_vector - x_vector;
                 get(u_list, t_idx*U_DIM, U_DIM, u);
                 u_vector = mat(u, U_DIM, 1);
+                // 公式51
                 delta_u = K_list[t_idx].matmul(delta_x) + d_list[t_idx]*learning_rate;
+                // 公式52
                 append(new_u_list, t_idx*U_DIM, (u_vector + delta_u).data, U_DIM);
                 get(new_u_list, t_idx*U_DIM, U_DIM, u);
-
+                // 公式53
                 transition(x, u, next_x, delta_t);
                 append(new_x_list, (t_idx+1)*X_DIM, next_x, X_DIM);
 
@@ -195,6 +237,7 @@ extern "C" {
     }
 }
 
+// 状态转移方程
 void transition(double* x, double* u, double* next_x, double delta_t){
     double u1 = u[0], u2 = u[1];
     double pos_x = x[0], pos_y = x[1], theta = x[2];
@@ -207,18 +250,21 @@ void transition(double* x, double* u, double* next_x, double delta_t){
     return;
 }
 
+// 将arr2的值追加到arr
 void append(double* arr, int arr_pos, double* arr2, int len_arr2){
     for(int i=0;i<len_arr2;i++){
         arr[i+arr_pos] = arr2[i];
     }
 }
 
+// 获取arr中从arr_pos开始的共len个值。存到target中。
 void get(double* arr, int arr_pos, int len, double* target){
     for(int i=0;i<len;i++){
         target[i] = arr[arr_pos + i];
     }
 }
 
+// 状态矩阵
 mat get_A(double* x, double* u, double delta_t){
     double next_x[X_DIM];
     double temp_x[X_DIM];
@@ -242,6 +288,7 @@ mat get_A(double* x, double* u, double delta_t){
     return A;
 }
 
+// 状态矩阵
 mat get_B(double* x, double* u, double delta_t){
     double next_x[X_DIM];
     double temp_u[U_DIM];
@@ -265,6 +312,7 @@ mat get_B(double* x, double* u, double delta_t){
     return B;
 }
 
+// 计算cost，状态到障碍物的距离为cost
 mat get_cost(double* x, double* hazard_list, double hazard_radius){
     double hazard_pos[2];
     double cost[COST_DIM];
@@ -275,6 +323,7 @@ mat get_cost(double* x, double* hazard_list, double hazard_radius){
     return mat(cost, COST_DIM, 1);
 }
 
+// cost 函数中的c(x)
 mat get_C(double* x, double* hazard_list, double hazard_radius, double delta_t){
     double temp_x[X_DIM];
     double eps = 0.001;
@@ -296,6 +345,7 @@ mat get_C(double* x, double* hazard_list, double hazard_radius, double delta_t){
     return A;
 }
 
+// 增广拉格朗日中的I，al-ilqr的公式7 
 mat get_I(const mat & cost_vector, const mat & lambda_vector, const mat & mu_vector){
     double* data = new double[COST_DIM*COST_DIM];
     for(int i=0;i<COST_DIM;i++){
